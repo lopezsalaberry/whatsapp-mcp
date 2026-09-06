@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.whatsapp-bridge</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/lopezsalaberry/base/code/whatsapp-mcp/deploy/mini/run-bridge.sh</string>
+  </array>
+  <key>WorkingDirectory</key><string>/Users/lopezsalaberry/.whatsapp-mcp</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>StandardOutPath</key><string>/Users/lopezsalaberry/.whatsapp-mcp/logs/bridge.log</string>
+  <key>StandardErrorPath</key><string>/Users/lopezsalaberry/.whatsapp-mcp/logs/bridge.err.log</string>
+</dict>
+</plist>

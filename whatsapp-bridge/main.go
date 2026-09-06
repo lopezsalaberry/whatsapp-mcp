@@ -48,6 +48,24 @@ var forwardSelfMessages = getEnvBool("FORWARD_SELF", true)
 var fullHistoryPairFlag = flag.Bool("full-history-pair", false,
 	"Request full history at pair time (only effective when re-pairing; no-op for existing sessions)")
 
+// Service mode (base-mcp fork): the bridge NEVER starts a pairing flow on its
+// own. Without a paired session it still serves the REST API so /api/health
+// can report status=not_paired, and it never asks WhatsApp for QR/pair codes
+// in a loop under launchd KeepAlive. Pairing is an explicit operator action
+// (run without --service, or with --pair-code). Env: WHATSAPP_SERVICE_MODE.
+var serviceModeFlag = flag.Bool("service", getEnvBool("WHATSAPP_SERVICE_MODE", false),
+	"Never start a pairing flow; if not paired, serve /api/health with status=not_paired and wait")
+
+// Pair with a phone-number code instead of a QR (whatsmeow PairPhone). The
+// phone is the international number without '+', e.g. 34600000000. Handy over
+// SSH where QR rendering is unreliable. Only used when there is no session.
+var pairCodeFlag = flag.String("pair-code", "", "Pair via 8-char code shown here and typed on the phone; value = phone number without '+'")
+
+// Message bodies are NOT logged unless explicitly enabled: under launchd the
+// stdout log would otherwise become a second, unrotated, plaintext copy of
+// every conversation. Env: WHATSAPP_LOG_MESSAGE_CONTENT=1 to opt in.
+var logMessageContent = getEnvBool("WHATSAPP_LOG_MESSAGE_CONTENT", false)
+
 const whatsmeowDBPath = "store/whatsapp.db"
 
 // getEnvBool reads a boolean env var with a default.
@@ -103,7 +121,7 @@ func NewMessageStore() (*MessageStore, error) {
 	}
 
 	// Open SQLite database for messages
-	db, err := sql.Open("sqlite3", "file:store/messages.db?_foreign_keys=on")
+	db, err := sql.Open("sqlite3", "file:store/messages.db?_foreign_keys=on&_journal_mode=WAL&_busy_timeout=10000&_synchronous=NORMAL")
 	if err != nil {
 		return nil, fmt.Errorf("failed to open message database: %v", err)
 	}
@@ -2021,8 +2039,14 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 			direction = "→"
 		}
 
-		// Log based on message type
-		if mediaType != "" {
+		// Log based on message type. Bodies only when explicitly enabled.
+		if !logMessageContent {
+			if mediaType != "" {
+				fmt.Printf("[%s] %s %s: [%s] (%d chars)\n", timestamp, direction, sender, mediaType, len(content))
+			} else if content != "" {
+				fmt.Printf("[%s] %s %s: (%d chars)\n", timestamp, direction, sender, len(content))
+			}
+		} else if mediaType != "" {
 			fmt.Printf("[%s] %s %s: [%s: %s] %s\n", timestamp, direction, sender, mediaType, filename, content)
 		} else if content != "" {
 			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
@@ -2277,12 +2301,18 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 	// Health check endpoint
 	mux.HandleFunc("/api/health", auth(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		loggedIn := client.Store.ID != nil
 		status := map[string]interface{}{
 			"status":    "ok",
 			"connected": client.IsConnected(),
+			"logged_in": loggedIn,
 			"timestamp": time.Now().Unix(),
 		}
-		if !client.IsConnected() {
+		if !loggedIn {
+			// Process alive but no paired session: 200 so supervisors don't
+			// restart-loop it; the MCP layer turns this into its own 503.
+			status["status"] = "not_paired"
+		} else if !client.IsConnected() {
 			status["status"] = "disconnected"
 			w.WriteHeader(http.StatusServiceUnavailable)
 		}
@@ -2987,6 +3017,13 @@ func main() {
 	maxRetries := 3
 	var connErr error
 
+	// base-mcp fork: in service mode an unpaired bridge never pairs by itself.
+	unpairedService := client.Store.ID == nil && *serviceModeFlag
+	if unpairedService {
+		logger.Warnf("Service mode without a paired session: NOT starting a pairing flow. Serving REST with status=not_paired. Pair with: wa-bridge --pair-code <phone> (stop the service first).")
+		goto connectionSuccess
+	}
+
 	for attempt := 1; attempt <= maxRetries; attempt++ {
 		logger.Infof("Connection attempt %d/%d...", attempt, maxRetries)
 
@@ -3016,10 +3053,32 @@ func main() {
 				continue
 			}
 
+			// Pair-code flow: ask WhatsApp for an 8-char code instead of a QR.
+			pairByCode := strings.TrimSpace(*pairCodeFlag) != ""
+			if pairByCode {
+				phone := strings.TrimLeft(strings.TrimSpace(*pairCodeFlag), "+")
+				code, pairErr := client.PairPhone(ctx, phone, true, whatsmeow.PairClientChrome, "Chrome (macOS)")
+				if pairErr != nil {
+					logger.Errorf("PairPhone failed: %v", pairErr)
+					client.Disconnect()
+					if attempt == maxRetries {
+						return
+					}
+					time.Sleep(5 * time.Second)
+					continue
+				}
+				fmt.Printf("\nPairing code for %s:  %s\n", phone, code)
+				fmt.Println("On the phone: WhatsApp > Linked devices > Link a device > Link with phone number instead, then type the code.")
+				fmt.Println("Waiting for the phone to confirm...")
+			}
+
 			// Print QR code for pairing with phone
 			qrCodeShown := false
 			for evt := range qrChan {
 				if evt.Event == "code" {
+					if pairByCode {
+						continue
+					}
 					if !qrCodeShown {
 						fmt.Println("\nScan this QR code with your WhatsApp app:")
 						qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
@@ -3070,12 +3129,16 @@ connectionSuccess:
 	// Wait a moment for connection to stabilize
 	time.Sleep(2 * time.Second)
 
-	if !client.IsConnected() {
+	if !unpairedService && !client.IsConnected() {
 		logger.Errorf("Failed to establish stable connection")
 		return
 	}
 
-	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
+	if unpairedService {
+		fmt.Println("\n! Not paired. REST server will report status=not_paired until an operator pairs the device.")
+	} else {
+		fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
+	}
 
 	// port and bridgeToken were already resolved above, before the connect/
 	// pairing loop, so the setup banner could print immediately.
@@ -3110,7 +3173,13 @@ connectionSuccess:
 				// Wait before reconnecting
 				time.Sleep(reconnectBackoff)
 
-				// Try to reconnect
+				// Try to reconnect. Never (re)pair from the reconnect loop: a
+				// logged-out device (Store.ID == nil) would otherwise open a
+				// fresh pairing session with WhatsApp on every attempt.
+				if client.Store.ID == nil {
+					logger.Warnf("Not paired (logged out?): skipping reconnect; operator must re-pair")
+					continue
+				}
 				if !client.IsConnected() {
 					err := client.Connect()
 					if err != nil {
