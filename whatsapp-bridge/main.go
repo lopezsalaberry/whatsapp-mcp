@@ -3029,75 +3029,79 @@ func main() {
 
 		// Connect to WhatsApp
 		if client.Store.ID == nil && strings.TrimSpace(*pairCodeFlag) != "" {
-			// Pair-code flow WITHOUT the QR channel: the QR channel runs out
-			// of codes after ~2.5 min and then disconnects the client, which
-			// leaves a phone that typed the code late stuck on "logging in".
-			// Here we connect, ask for a code and wait for PairSuccess.
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+			// Pair-code flow WITHOUT the QR channel. WhatsApp closes the pairing
+			// stream after a few minutes, so whenever the socket drops before
+			// PairSuccess we reconnect and print a FRESH code, until the phone
+			// confirms or the overall window (15 min) expires. Typing an old
+			// code after a stream end leaves the phone stuck on "logging in".
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 			defer cancel()
 			phone := strings.TrimLeft(strings.TrimSpace(*pairCodeFlag), "+")
-			pairDone := make(chan error, 1)
+			pairDone := make(chan error, 4)
+			errStreamDropped := errors.New("pairing stream dropped")
 			client.AddEventHandler(func(evt interface{}) {
 				switch v := evt.(type) {
 				case *events.PairSuccess:
-					select {
-					case pairDone <- nil:
-					default:
-					}
+					pairDone <- nil
 				case *events.PairError:
+					pairDone <- v.Error
+				case *events.Disconnected, *events.StreamError, *events.ConnectFailure:
 					select {
-					case pairDone <- v.Error:
+					case pairDone <- errStreamDropped:
 					default:
 					}
 				}
 			})
-			if connErr = client.Connect(); connErr != nil {
-				logger.Errorf("Failed to connect (attempt %d): %v", attempt, connErr)
-				if attempt == maxRetries {
+			paired := false
+			for round := 1; !paired; round++ {
+				if ctx.Err() != nil {
+					logger.Errorf("Pairing window expired without confirmation")
 					return
 				}
-				time.Sleep(5 * time.Second)
-				continue
-			}
-			code, pairErr := client.PairPhone(ctx, phone, true, whatsmeow.PairClientChrome, "Chrome (macOS)")
-			if pairErr != nil {
-				logger.Errorf("PairPhone failed: %v", pairErr)
-				client.Disconnect()
-				if attempt == maxRetries {
-					return
+				// Drain stale signals from a previous round.
+				for len(pairDone) > 0 {
+					<-pairDone
 				}
-				time.Sleep(5 * time.Second)
-				continue
-			}
-			fmt.Printf("\nPairing code for %s:  %s\n", phone, code)
-			fmt.Println("On the phone: WhatsApp > Linked devices > Link a device > Link with phone number instead, then type the code.")
-			fmt.Println("Waiting up to 10 minutes for the phone to confirm...")
-			select {
-			case perr := <-pairDone:
-				if perr != nil {
-					logger.Errorf("Pairing failed: %v", perr)
-					client.Disconnect()
-					if attempt == maxRetries {
-						return
-					}
+				if connErr = client.Connect(); connErr != nil {
+					logger.Errorf("Failed to connect (round %d): %v", round, connErr)
 					time.Sleep(5 * time.Second)
 					continue
 				}
-				fmt.Println("\nPaired! Waiting for the post-pair reconnect...")
-				deadline := time.Now().Add(60 * time.Second)
-				for !client.IsConnected() && time.Now().Before(deadline) {
-					time.Sleep(500 * time.Millisecond)
+				code, pairErr := client.PairPhone(ctx, phone, true, whatsmeow.PairClientChrome, "Chrome (macOS)")
+				if pairErr != nil {
+					logger.Errorf("PairPhone failed (round %d): %v", round, pairErr)
+					client.Disconnect()
+					time.Sleep(5 * time.Second)
+					continue
 				}
-				goto connectionSuccess
-			case <-ctx.Done():
-				logger.Errorf("Timeout waiting for the pairing code to be typed (attempt %d)", attempt)
-				client.Disconnect()
-				if attempt == maxRetries {
+				fmt.Printf("\nPairing code for %s (round %d):  %s\n", phone, round, code)
+				fmt.Println("On the phone: WhatsApp > Linked devices > Link a device > Link with phone number instead, then type the code NOW (it lives ~3 min; a fresh one prints if the stream drops).")
+				select {
+				case perr := <-pairDone:
+					switch {
+					case perr == nil:
+						paired = true
+					case errors.Is(perr, errStreamDropped):
+						logger.Warnf("Pairing stream dropped before confirmation; issuing a new code")
+						client.Disconnect()
+						time.Sleep(2 * time.Second)
+					default:
+						logger.Errorf("Pairing failed: %v", perr)
+						client.Disconnect()
+						time.Sleep(5 * time.Second)
+					}
+				case <-ctx.Done():
+					logger.Errorf("Timeout waiting for the pairing code to be typed")
+					client.Disconnect()
 					return
 				}
-				time.Sleep(5 * time.Second)
-				continue
 			}
+			fmt.Println("\nPaired! Waiting for the post-pair reconnect...")
+			deadline := time.Now().Add(90 * time.Second)
+			for !client.IsConnected() && time.Now().Before(deadline) {
+				time.Sleep(500 * time.Millisecond)
+			}
+			goto connectionSuccess
 		} else if client.Store.ID == nil {
 			// No ID stored, this is a new client, need to pair with phone
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
