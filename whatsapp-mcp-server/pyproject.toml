@@ -32,6 +32,10 @@ dev = [
     "pytest-asyncio>=1.4.0",
     "ruff>=0.15.15",
 ]
+base = [
+    # Fork-only base layer (base_server.py): local voice-note transcription.
+    "faster-whisper>=1.2.1",
+]
 
 [project.urls]
 Homepage = "https://github.com/verygoodplugins/whatsapp-mcp"

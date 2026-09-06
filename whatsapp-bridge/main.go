@@ -3028,7 +3028,77 @@ func main() {
 		logger.Infof("Connection attempt %d/%d...", attempt, maxRetries)
 
 		// Connect to WhatsApp
-		if client.Store.ID == nil {
+		if client.Store.ID == nil && strings.TrimSpace(*pairCodeFlag) != "" {
+			// Pair-code flow WITHOUT the QR channel: the QR channel runs out
+			// of codes after ~2.5 min and then disconnects the client, which
+			// leaves a phone that typed the code late stuck on "logging in".
+			// Here we connect, ask for a code and wait for PairSuccess.
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+			defer cancel()
+			phone := strings.TrimLeft(strings.TrimSpace(*pairCodeFlag), "+")
+			pairDone := make(chan error, 1)
+			client.AddEventHandler(func(evt interface{}) {
+				switch v := evt.(type) {
+				case *events.PairSuccess:
+					select {
+					case pairDone <- nil:
+					default:
+					}
+				case *events.PairError:
+					select {
+					case pairDone <- v.Error:
+					default:
+					}
+				}
+			})
+			if connErr = client.Connect(); connErr != nil {
+				logger.Errorf("Failed to connect (attempt %d): %v", attempt, connErr)
+				if attempt == maxRetries {
+					return
+				}
+				time.Sleep(5 * time.Second)
+				continue
+			}
+			code, pairErr := client.PairPhone(ctx, phone, true, whatsmeow.PairClientChrome, "Chrome (macOS)")
+			if pairErr != nil {
+				logger.Errorf("PairPhone failed: %v", pairErr)
+				client.Disconnect()
+				if attempt == maxRetries {
+					return
+				}
+				time.Sleep(5 * time.Second)
+				continue
+			}
+			fmt.Printf("\nPairing code for %s:  %s\n", phone, code)
+			fmt.Println("On the phone: WhatsApp > Linked devices > Link a device > Link with phone number instead, then type the code.")
+			fmt.Println("Waiting up to 10 minutes for the phone to confirm...")
+			select {
+			case perr := <-pairDone:
+				if perr != nil {
+					logger.Errorf("Pairing failed: %v", perr)
+					client.Disconnect()
+					if attempt == maxRetries {
+						return
+					}
+					time.Sleep(5 * time.Second)
+					continue
+				}
+				fmt.Println("\nPaired! Waiting for the post-pair reconnect...")
+				deadline := time.Now().Add(60 * time.Second)
+				for !client.IsConnected() && time.Now().Before(deadline) {
+					time.Sleep(500 * time.Millisecond)
+				}
+				goto connectionSuccess
+			case <-ctx.Done():
+				logger.Errorf("Timeout waiting for the pairing code to be typed (attempt %d)", attempt)
+				client.Disconnect()
+				if attempt == maxRetries {
+					return
+				}
+				time.Sleep(5 * time.Second)
+				continue
+			}
+		} else if client.Store.ID == nil {
 			// No ID stored, this is a new client, need to pair with phone
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 			defer cancel()
@@ -3053,32 +3123,10 @@ func main() {
 				continue
 			}
 
-			// Pair-code flow: ask WhatsApp for an 8-char code instead of a QR.
-			pairByCode := strings.TrimSpace(*pairCodeFlag) != ""
-			if pairByCode {
-				phone := strings.TrimLeft(strings.TrimSpace(*pairCodeFlag), "+")
-				code, pairErr := client.PairPhone(ctx, phone, true, whatsmeow.PairClientChrome, "Chrome (macOS)")
-				if pairErr != nil {
-					logger.Errorf("PairPhone failed: %v", pairErr)
-					client.Disconnect()
-					if attempt == maxRetries {
-						return
-					}
-					time.Sleep(5 * time.Second)
-					continue
-				}
-				fmt.Printf("\nPairing code for %s:  %s\n", phone, code)
-				fmt.Println("On the phone: WhatsApp > Linked devices > Link a device > Link with phone number instead, then type the code.")
-				fmt.Println("Waiting for the phone to confirm...")
-			}
-
 			// Print QR code for pairing with phone
 			qrCodeShown := false
 			for evt := range qrChan {
 				if evt.Event == "code" {
-					if pairByCode {
-						continue
-					}
 					if !qrCodeShown {
 						fmt.Println("\nScan this QR code with your WhatsApp app:")
 						qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
