@@ -409,6 +409,11 @@ def mark_messages_read(
 def send_file(recipient: str, media_path: str, caption: str = "") -> dict[str, Any]:
     """Send a file (image, video, document) via WhatsApp, optionally with a caption.
 
+    media_path MUST already live on this Mac mini under the WhatsApp outbox/store
+    (typically the absolute path returned by put_outbox). Do NOT pass paths from
+    another machine or agent sandbox (/workspace/..., Downloads, etc.) — those
+    are invisible here. Remote flow: put_outbox(content_base64|url) → send_file(path).
+
     When `caption` is provided, the file and text arrive as a single
     attachment-with-caption message (one bubble in the WA UI), instead of
     needing a separate follow-up send_message call. For group chats use the JID.
@@ -416,7 +421,7 @@ def send_file(recipient: str, media_path: str, caption: str = "") -> dict[str, A
     Args:
         recipient: Either a phone number with country code (no + or symbols),
                  or a JID (e.g., "123456789@s.whatsapp.net" or "123456789@g.us")
-        media_path: Absolute path to the media file (image, video, document)
+        media_path: Absolute path under outbox/store on this host (from put_outbox)
         caption: Optional text rendered with the file as a caption. Omit for a
                  bare attachment.
 
@@ -431,12 +436,16 @@ def send_file(recipient: str, media_path: str, caption: str = "") -> dict[str, A
 
 @mcp.tool()
 def send_audio_message(recipient: str, media_path: str) -> dict[str, Any]:
-    """Send any audio file as a WhatsApp audio message to the specified recipient. For group messages use the JID. If it errors due to ffmpeg not being installed, use send_file instead.
+    """Send any audio file as a WhatsApp audio message to the specified recipient.
+
+    media_path MUST already live on this Mac mini under outbox/store (use put_outbox
+    first if the file is on another machine). For group messages use the JID. If it
+    errors due to ffmpeg not being installed, use send_file instead.
 
     Args:
         recipient: The recipient - either a phone number with country code but no + or other symbols,
                  or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
-        media_path: The absolute path to the audio file to send (will be converted to Opus .ogg if it's not a .ogg file)
+        media_path: Absolute path under outbox/store on this host (from put_outbox); converted to Opus .ogg if needed
 
     Returns:
         A dictionary containing success status and a status message

@@ -19,6 +19,9 @@ Environment variables:
                           (default ~/.whatsapp-mcp/state.db).
     WA_OUTBOX             Directory where put_outbox stores files
                           (default ~/.whatsapp-mcp/outbox).
+    WHATSAPP_MEDIA_ROOTS  Colon-separated absolute dirs allowed for send_file /
+                          send_audio_message media_path (default: WA_OUTBOX and
+                          its sibling ``store/``, matching the bridge).
     WA_SEND_REQUIRE_CONFIRM
                           "1" (default): every send is two-step -- the first call
                           returns a preview + confirm_token, the second call with
@@ -42,6 +45,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import hmac
 import logging
 import os
@@ -75,6 +79,12 @@ OPEN_PATHS = frozenset({"/health"})
 OUTBOX_MAX_BYTES = 50 * 1024 * 1024
 BRIDGE_HEALTH_TIMEOUT_S = 5
 OUTBOX_FETCH_TIMEOUT_S = 30
+MEDIA_PATH_HINT = (
+    "media_path must be an absolute path under the WhatsApp outbox/store on this Mac mini "
+    "(the path returned by put_outbox). Paths from another machine or sandbox "
+    "(e.g. /workspace/..., ~/Downloads) are not visible here — call put_outbox with "
+    "content_base64 or url first, then send_file/send_audio_message with the path it returns."
+)
 TWO_STEP_DOC = (
     "Two-step send AS JUAN from his personal WhatsApp. Call WITHOUT confirm_token -> returns a preview and a "
     "10-minute single-use token. Show the preview to Juan and call again WITH the token ONLY after he explicitly "
@@ -102,6 +112,7 @@ class Settings:
     allow_no_auth: bool = False
     state_db: str = os.path.expanduser("~/.whatsapp-mcp/state.db")
     outbox: str = os.path.expanduser("~/.whatsapp-mcp/outbox")
+    media_roots: tuple[str, ...] = ()
     send_require_confirm: bool = True
     send_max_per_hour: int = 30
     dedup_seconds: float = 300.0
@@ -142,13 +153,22 @@ def load_settings() -> Settings:
     port = _env_int("WA_MCP_PORT", 8804)
     if not 1 <= port <= 65535:
         raise ValueError(f"Invalid WA_MCP_PORT: {port}")
+    outbox = os.path.expanduser(os.getenv("WA_OUTBOX", "").strip() or "~/.whatsapp-mcp/outbox")
+    # Create before resolving roots so realpath matches files written later
+    # (macOS: /var/folders → /private/var/folders).
+    os.makedirs(outbox, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(outbox, 0o700)
+    except OSError:
+        pass
     return Settings(
         host=os.getenv("WA_MCP_HOST", "").strip() or "127.0.0.1",
         port=port,
         token=token,
         allow_no_auth=allow_no_auth,
         state_db=os.path.expanduser(os.getenv("WA_STATE_DB", "").strip() or "~/.whatsapp-mcp/state.db"),
-        outbox=os.path.expanduser(os.getenv("WA_OUTBOX", "").strip() or "~/.whatsapp-mcp/outbox"),
+        outbox=outbox,
+        media_roots=tuple(_resolve_media_roots(outbox)),
         send_require_confirm=(os.getenv("WA_SEND_REQUIRE_CONFIRM", "").strip() or "1") != "0",
         send_max_per_hour=_env_int("WA_SEND_MAX_PER_HOUR", 30),
         dedup_seconds=_env_float("WA_DEDUP_SECONDS", 300.0),
@@ -158,6 +178,64 @@ def load_settings() -> Settings:
         stt_sync_max_s=_env_float("WA_STT_SYNC_MAX_S", 45.0),
         stt_idle_unload_s=_env_float("WA_STT_IDLE_UNLOAD_S", 600.0),
         stt_language=os.getenv("WA_STT_LANGUAGE", "").strip() or "es",
+    )
+
+
+def _canonicalize_existing_dir(path: str) -> str:
+    abs_path = os.path.abspath(os.path.expanduser(path))
+    try:
+        return os.path.realpath(abs_path)
+    except OSError:
+        return abs_path
+
+
+def _resolve_media_roots(outbox: str) -> list[str]:
+    """Same policy as the Go bridge: WHATSAPP_MEDIA_ROOTS, else outbox + sibling store."""
+    env = os.getenv("WHATSAPP_MEDIA_ROOTS", "").strip()
+    if env:
+        roots: list[str] = []
+        for raw in env.split(os.pathsep):
+            raw = raw.strip()
+            if not raw:
+                continue
+            expanded = os.path.expanduser(raw)
+            if not os.path.isabs(expanded):
+                raise ValueError(f"WHATSAPP_MEDIA_ROOTS entries must be absolute paths, got {raw!r}")
+            roots.append(_canonicalize_existing_dir(expanded))
+        if not roots:
+            raise ValueError("WHATSAPP_MEDIA_ROOTS is set but contains no valid entries")
+        return roots
+    outbox_root = _canonicalize_existing_dir(outbox)
+    store_root = _canonicalize_existing_dir(os.path.join(os.path.dirname(outbox_root), "store"))
+    return [outbox_root, store_root]
+
+
+def _path_has_prefix(child: str, parent: str) -> bool:
+    if child == parent:
+        return True
+    prefix = parent if parent.endswith(os.sep) else parent + os.sep
+    return child.startswith(prefix)
+
+
+def validate_send_media_path(media_path: str, roots: tuple[str, ...] | list[str]) -> tuple[str | None, str | None]:
+    """Return (canonical_path, None) or (None, error_message) for outbound media."""
+    if not media_path or not str(media_path).strip():
+        return None, f"Media path must be provided. {MEDIA_PATH_HINT}"
+    path = str(media_path).strip()
+    if not os.path.isabs(path):
+        return None, f"media_path must be absolute, got {path!r}. {MEDIA_PATH_HINT}"
+    try:
+        resolved = os.path.realpath(path)
+    except OSError as exc:
+        return None, f"resolve media_path failed: {exc}. {MEDIA_PATH_HINT}"
+    if not os.path.isfile(resolved):
+        return None, f"Media file not found: {path}. {MEDIA_PATH_HINT}"
+    for root in roots:
+        if _path_has_prefix(resolved, root):
+            return resolved, None
+    return None, (
+        f"media_path {resolved!r} is outside the configured media roots "
+        f"({', '.join(roots)}). {MEDIA_PATH_HINT}"
     )
 
 
@@ -349,6 +427,30 @@ def _open_unique(outbox: str, name: str) -> tuple[str, int]:
     raise ValueError("could not find a free file name in the outbox")
 
 
+def _store_outbox_bytes(outbox: str, filename: str, data: bytes) -> dict[str, Any]:
+    """Write ``data`` into the outbox under a safe unique name. Raises ValueError/OSError."""
+    name = _validate_outbox_filename(filename)
+    if len(data) > OUTBOX_MAX_BYTES:
+        raise ValueError(f"content is larger than {OUTBOX_MAX_BYTES} bytes")
+    path, fd = _open_unique(outbox, name)
+    try:
+        with os.fdopen(fd, "wb") as out:
+            out.write(data)
+    except Exception:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
+    logger.info("outbox: stored name=%s bytes=%d", os.path.basename(path), len(data))
+    return {
+        "success": True,
+        "path": path,
+        "bytes": len(data),
+        "message": f"stored {os.path.basename(path)}",
+    }
+
+
 def _fetch_url_to(fd: int, url: str) -> int:
     parts = urlsplit(url)
     if parts.scheme not in {"http", "https"} or not parts.netloc:
@@ -484,17 +586,27 @@ def build_server(settings: Settings | None = None) -> BaseServer:
         recipient: str, media_path: str, caption: str = "", confirm_token: str = "", idempotency_key: str = ""
     ) -> dict[str, Any]:
         """Two-step send AS JUAN from his personal WhatsApp (see tool description)."""
+        canonical, err = validate_send_media_path(media_path, settings.media_roots)
+        if err:
+            logger.warning("send_file: media_path rejected path=%r", media_path)
+            return {
+                "success": False,
+                "error": "MEDIA_PATH_REJECTED",
+                "message": err,
+                "guard": _quota(guard),
+            }
+        assert canonical is not None
         return _guarded_send(
             guard,
             "file",
             recipient,
-            content_hash("file", recipient, media_path, caption),
+            content_hash("file", recipient, canonical, caption),
             idempotency_key,
             len(caption or ""),
-            lambda: main.send_file(recipient, media_path, caption),
+            lambda: main.send_file(recipient, canonical, caption),
             confirm_token=confirm_token,
             preview=lambda: _preview(
-                "file", recipient, caption=caption, media_path=media_path, media_bytes=_file_size(media_path)
+                "file", recipient, caption=caption, media_path=canonical, media_bytes=_file_size(canonical)
             ),
             require_confirm=require_confirm,
         )
@@ -503,16 +615,26 @@ def build_server(settings: Settings | None = None) -> BaseServer:
         recipient: str, media_path: str, confirm_token: str = "", idempotency_key: str = ""
     ) -> dict[str, Any]:
         """Two-step send AS JUAN from his personal WhatsApp (see tool description)."""
+        canonical, err = validate_send_media_path(media_path, settings.media_roots)
+        if err:
+            logger.warning("send_audio_message: media_path rejected path=%r", media_path)
+            return {
+                "success": False,
+                "error": "MEDIA_PATH_REJECTED",
+                "message": err,
+                "guard": _quota(guard),
+            }
+        assert canonical is not None
         return _guarded_send(
             guard,
             "audio",
             recipient,
-            content_hash("audio", recipient, media_path),
+            content_hash("audio", recipient, canonical),
             idempotency_key,
             0,
-            lambda: main.send_audio_message(recipient, media_path),
+            lambda: main.send_audio_message(recipient, canonical),
             confirm_token=confirm_token,
-            preview=lambda: _preview("audio", recipient, media_path=media_path, media_bytes=_file_size(media_path)),
+            preview=lambda: _preview("audio", recipient, media_path=canonical, media_bytes=_file_size(canonical)),
             require_confirm=require_confirm,
         )
 
@@ -542,15 +664,17 @@ def build_server(settings: Settings | None = None) -> BaseServer:
         return transcriber.transcribe(message_id, chat_jid, language)
 
     def put_outbox(filename: str, content_base64: str = "", url: str = "") -> dict[str, Any]:
-        """Store a file in the outbox so it can be sent later with send_file or send_audio_message.
+        """REQUIRED first step when the file is not already on this Mac mini — text path.
 
-        Provide exactly one of content_base64 or url. The filename must be a bare name (no
-        directories, no leading dot); if it already exists a numeric suffix (-1, -2, ...) is added,
-        never overwriting. Files larger than 50 MB are rejected.
+        Prefer the binary HTTP upload when the client can POST a file (no LLM rewrite):
+        ``POST /outbox`` multipart field ``file`` (optional ``filename``, ``sha256``) with the
+        same bearer token. That keeps bytes intact. This tool is the fallback: exactly one of
+        content_base64 or url. Bare filename only (no directories, no leading dot); existing
+        names get a numeric suffix. Max 50 MB.
 
         Args:
             filename: Bare file name, e.g. "invoice.pdf"
-            content_base64: File bytes encoded in base64
+            content_base64: File bytes encoded in base64 (fragile if an LLM retypes it)
             url: http(s) URL to download the file from (30 s timeout)
 
         Returns:
@@ -565,33 +689,35 @@ def build_server(settings: Settings | None = None) -> BaseServer:
                 "success": False,
                 "path": None,
                 "bytes": 0,
-                "message": "provide exactly one of content_base64 or url",
+                "message": "provide exactly one of content_base64 or url (or POST multipart to /outbox)",
             }
 
-        path, fd = _open_unique(settings.outbox, name)
         try:
             if content_base64:
                 try:
                     data = base64.b64decode(content_base64, validate=True)
                 except (binascii.Error, ValueError):
                     raise ValueError("content_base64 is not valid base64") from None
-                if len(data) > OUTBOX_MAX_BYTES:
-                    raise ValueError(f"content is larger than {OUTBOX_MAX_BYTES} bytes")
-                with os.fdopen(fd, "wb") as out:
-                    out.write(data)
-                size = len(data)
-            else:
-                size = _fetch_url_to(fd, url)
-        except (ValueError, OSError, requests.RequestException) as exc:
+                return _store_outbox_bytes(settings.outbox, name, data)
+            path, fd = _open_unique(settings.outbox, name)
             try:
-                os.unlink(path)
-            except OSError:
-                pass
+                size = _fetch_url_to(fd, url)
+            except (ValueError, OSError, requests.RequestException) as exc:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+                raise
+            logger.info("outbox: stored name=%s bytes=%d", os.path.basename(path), size)
+            return {
+                "success": True,
+                "path": path,
+                "bytes": size,
+                "message": f"stored {os.path.basename(path)}",
+            }
+        except (ValueError, OSError, requests.RequestException) as exc:
             logger.warning("outbox: rejected name=%s reason=%s", name, type(exc).__name__)
             return {"success": False, "path": None, "bytes": 0, "message": str(exc)}
-
-        logger.info("outbox: stored name=%s bytes=%d", os.path.basename(path), size)
-        return {"success": True, "path": path, "bytes": size, "message": f"stored {os.path.basename(path)}"}
 
     def send_quota() -> dict[str, Any]:
         """Report how many sends happened in the last hour against the configured limit.
@@ -629,6 +755,80 @@ def build_server(settings: Settings | None = None) -> BaseServer:
             ok = False
             payload = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
         return JSONResponse(payload, status_code=200 if ok else 503)
+
+    @mcp.custom_route("/outbox", methods=["POST"])
+    async def outbox_upload(request: Request) -> Response:
+        """Binary upload into the outbox (multipart). Prefer this over put_outbox base64."""
+        try:
+            form = await request.form()
+        except Exception as exc:
+            return JSONResponse(
+                {"success": False, "path": None, "bytes": 0, "message": f"invalid multipart: {exc}"},
+                status_code=400,
+            )
+        upload = form.get("file")
+        if upload is None:
+            return JSONResponse(
+                {
+                    "success": False,
+                    "path": None,
+                    "bytes": 0,
+                    "message": "multipart field 'file' is required",
+                },
+                status_code=400,
+            )
+        filename_field = form.get("filename")
+        if isinstance(filename_field, str) and filename_field.strip():
+            filename = filename_field.strip()
+        else:
+            filename = (getattr(upload, "filename", None) or "").strip() or "upload.bin"
+        expected_sha = form.get("sha256")
+        if hasattr(expected_sha, "strip"):
+            expected_sha = expected_sha.strip() or None
+        else:
+            expected_sha = None
+
+        try:
+            if hasattr(upload, "read"):
+                data = await upload.read()
+            elif isinstance(upload, (bytes, bytearray)):
+                data = bytes(upload)
+            elif isinstance(upload, str):
+                data = upload.encode("utf-8")
+            else:
+                return JSONResponse(
+                    {"success": False, "path": None, "bytes": 0, "message": "file field is not readable"},
+                    status_code=400,
+                )
+            if not isinstance(data, (bytes, bytearray)):
+                data = bytes(data)
+            data = bytes(data)
+            if expected_sha:
+                digest = hashlib.sha256(data).hexdigest()
+                if digest.lower() != str(expected_sha).lower():
+                    return JSONResponse(
+                        {
+                            "success": False,
+                            "path": None,
+                            "bytes": len(data),
+                            "message": f"sha256 mismatch: got {digest}, expected {expected_sha}",
+                        },
+                        status_code=400,
+                    )
+            result = await run_in_threadpool(_store_outbox_bytes, settings.outbox, filename, data)
+            return JSONResponse(result, status_code=200)
+        except ValueError as exc:
+            logger.warning("outbox upload rejected: %s", exc)
+            return JSONResponse(
+                {"success": False, "path": None, "bytes": 0, "message": str(exc)},
+                status_code=400,
+            )
+        except OSError as exc:
+            logger.exception("outbox upload failed")
+            return JSONResponse(
+                {"success": False, "path": None, "bytes": 0, "message": f"write failed: {exc}"},
+                status_code=500,
+            )
 
     return BaseServer(settings=settings, mcp=mcp, guard=guard, transcriber=transcriber)
 
@@ -700,7 +900,7 @@ def _main() -> int:
     if settings.token is None:
         logger.warning("WA_MCP_ALLOW_NO_AUTH=1: running WITHOUT bearer auth (dev only)")
     logger.info(
-        "listening on http://%s:%d/mcp (health at /health, outbox=%s, state=%s)",
+        "listening on http://%s:%d/mcp (health at /health, binary outbox POST /outbox, outbox=%s, state=%s)",
         settings.host,
         settings.port,
         settings.outbox,

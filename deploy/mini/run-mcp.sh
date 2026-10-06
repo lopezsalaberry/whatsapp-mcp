@@ -11,5 +11,7 @@ export WHATSMEOW_DB_PATH="${WHATSMEOW_DB_PATH:-$HOME_DIR/store/whatsapp.db}"
 export WA_MCP_PORT="${WA_MCP_PORT:-8804}"
 export WA_STATE_DB="${WA_STATE_DB:-$HOME_DIR/state.db}"
 export WA_OUTBOX="${WA_OUTBOX:-$HOME_DIR/outbox}"
+# Same allow-list as the bridge: send_file rejects foreign paths before confirm.
+export WHATSAPP_MEDIA_ROOTS="${WHATSAPP_MEDIA_ROOTS:-$HOME_DIR/outbox:$HOME_DIR/store}"
 cd "$REPO"
 exec uv run --project "$REPO" --extra base python base_server.py

@@ -1,9 +1,11 @@
 """Tests for base_server: tool surface, guarded sends, outbox, /health and auth."""
 
 import base64
+import hashlib
 import os
 import sqlite3
 import time
+from pathlib import Path
 
 import pytest
 import requests
@@ -32,6 +34,9 @@ def env(tmp_path, monkeypatch):
     monkeypatch.delenv("WA_MCP_ALLOW_NO_AUTH", raising=False)
     monkeypatch.setenv("WA_STATE_DB", str(tmp_path / "state" / "state.db"))
     monkeypatch.setenv("WA_OUTBOX", str(tmp_path / "outbox"))
+    # Isolate from the mini's launchd/shell WHATSAPP_MEDIA_ROOTS so tests use
+    # the temporary outbox (+ sibling store), not ~/.whatsapp-mcp.
+    monkeypatch.delenv("WHATSAPP_MEDIA_ROOTS", raising=False)
     monkeypatch.setenv("WA_SEND_MAX_PER_HOUR", "2")
     monkeypatch.setenv("WA_DEDUP_SECONDS", "300")
     monkeypatch.delenv("WA_SEND_REQUIRE_CONFIRM", raising=False)  # default: confirm gate ON
@@ -208,17 +213,33 @@ class TestGuardedSends:
         assert result["success"] is False
         assert server.guard.sends_last_hour() == 0
 
-    def test_send_file_and_audio_wrappers(self, server, sent):
-        file_result = server.tool("send_file")("111@s.whatsapp.net", "/tmp/a.pdf", "caption")
+    def test_send_file_and_audio_wrappers(self, server, sent, no_confirm):
+        outbox = no_confirm / "outbox"
+        pdf = outbox / "a.pdf"
+        ogg = outbox / "a.ogg"
+        pdf.write_bytes(b"%PDF")
+        ogg.write_bytes(b"OggS")
+        file_result = server.tool("send_file")("111@s.whatsapp.net", str(pdf), "caption")
         assert file_result["success"] is True and file_result["guard"]["sends_last_hour"] == 1
-        assert sent["file"] == [("111@s.whatsapp.net", "/tmp/a.pdf", "caption")]
+        assert sent["file"] == [("111@s.whatsapp.net", os.path.realpath(pdf), "caption")]
 
-        dup = server.tool("send_file")("111@s.whatsapp.net", "/tmp/a.pdf", "caption")
+        dup = server.tool("send_file")("111@s.whatsapp.net", str(pdf), "caption")
         assert dup["deduplicated"] is True
 
-        audio_result = server.tool("send_audio_message")("111@s.whatsapp.net", "/tmp/a.ogg")
+        audio_result = server.tool("send_audio_message")("111@s.whatsapp.net", str(ogg))
         assert audio_result["success"] is True
-        assert sent["audio"] == [("111@s.whatsapp.net", "/tmp/a.ogg")]
+        assert sent["audio"] == [("111@s.whatsapp.net", os.path.realpath(ogg))]
+
+    def test_send_file_rejects_foreign_path_without_confirm(self, server, sent, no_confirm):
+        foreign = no_confirm / "workspace" / "doc.pdf"
+        foreign.parent.mkdir()
+        foreign.write_bytes(b"%PDF")
+        result = server.tool("send_file")("111@s.whatsapp.net", str(foreign), "x")
+        assert result["success"] is False
+        assert result["error"] == "MEDIA_PATH_REJECTED"
+        assert "put_outbox" in result["message"]
+        assert sent["file"] == []
+        assert server.guard.sends_last_hour() == 0
 
     def test_send_quota(self, server, sent):
         quota = server.tool("send_quota")()
@@ -281,20 +302,43 @@ class TestConfirmGate:
 
     def test_file_and_audio_previews(self, server, sent, env, monkeypatch):
         monkeypatch.setattr(whatsapp, "MESSAGES_DB_PATH", str(env / "missing.db"))
-        media = env / "doc.pdf"
+        outbox = env / "outbox"
+        media = outbox / "doc.pdf"
         media.write_bytes(b"%PDF-1.4 hello")
+        audio = outbox / "note.ogg"
+        audio.write_bytes(b"OggS")
         file_result = server.tool("send_file")("111@s.whatsapp.net", str(media), "mirá esto")
         assert file_result["status"] == "confirm_required"
         assert file_result["preview"]["kind"] == "file"
         assert file_result["preview"]["caption"] == "mirá esto"
-        assert file_result["preview"]["media_path"] == str(media)
+        assert file_result["preview"]["media_path"] == os.path.realpath(media)
         assert file_result["preview"]["media_bytes"] == 14
 
-        audio_result = server.tool("send_audio_message")("111@s.whatsapp.net", str(env / "nope.ogg"))
+        audio_result = server.tool("send_audio_message")("111@s.whatsapp.net", str(audio))
         assert audio_result["status"] == "confirm_required"
         assert audio_result["preview"]["kind"] == "audio"
-        assert audio_result["preview"]["media_bytes"] is None
+        assert audio_result["preview"]["media_path"] == os.path.realpath(audio)
+        assert audio_result["preview"]["media_bytes"] == 4
         assert sent["file"] == [] and sent["audio"] == []
+
+    def test_file_preview_rejects_path_outside_outbox(self, server, sent, env, monkeypatch):
+        monkeypatch.setattr(whatsapp, "MESSAGES_DB_PATH", str(env / "missing.db"))
+        foreign = env / "elsewhere" / "doc.pdf"
+        foreign.parent.mkdir()
+        foreign.write_bytes(b"%PDF")
+        result = server.tool("send_file")("111@s.whatsapp.net", str(foreign), "no")
+        assert result["success"] is False
+        assert result["error"] == "MEDIA_PATH_REJECTED"
+        assert "confirm_token" not in result
+        assert sent["file"] == []
+        assert server.guard.sends_last_hour() == 0
+
+    def test_file_preview_rejects_missing_and_workspace_paths(self, server, sent, env):
+        missing = server.tool("send_file")("111@s.whatsapp.net", "/workspace/Factura.pdf")
+        assert missing["error"] == "MEDIA_PATH_REJECTED"
+        assert "put_outbox" in missing["message"]
+        assert "confirm_token" not in missing
+        assert sent["file"] == []
 
     def test_token_sends_once_and_second_use_is_rejected(self, server, sent, env, monkeypatch):
         monkeypatch.setattr(whatsapp, "MESSAGES_DB_PATH", str(env / "missing.db"))
@@ -322,7 +366,9 @@ class TestConfirmGate:
         assert other_text["status"] == "confirm_rejected" and other_text["error"] == "PAYLOAD_MISMATCH"
         other_recipient = send("222@s.whatsapp.net", "hola", confirm_token=token)
         assert other_recipient["error"] == "PAYLOAD_MISMATCH"
-        other_kind = server.tool("send_file")("111@s.whatsapp.net", "hola", confirm_token=token)
+        pdf = env / "outbox" / "x.pdf"
+        pdf.write_bytes(b"%PDF")
+        other_kind = server.tool("send_file")("111@s.whatsapp.net", str(pdf), confirm_token=token)
         assert other_kind["error"] == "PAYLOAD_MISMATCH"
         assert sent["message"] == [] and sent["file"] == []
 
@@ -451,6 +497,53 @@ class TestPutOutbox:
         monkeypatch.setattr(requests, "get", fake_get)
         assert put("a.txt", url="https://example.com/a.txt")["success"] is False
         assert list((env / "outbox").iterdir()) == []
+
+
+class TestOutboxBinaryUpload:
+    def test_multipart_stores_bytes_intact(self, client, env):
+        payload = b"%PDF-1.4 binary-ok-" + bytes(range(256))
+        resp = client.post(
+            "/outbox",
+            headers=AUTH,
+            files={"file": ("Factura_test.pdf", payload, "application/pdf")},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["success"] is True
+        assert body["bytes"] == len(payload)
+        assert Path(body["path"]).read_bytes() == payload
+        assert Path(body["path"]).name.startswith("Factura_test")
+
+    def test_multipart_sha256_and_filename_override(self, client, env):
+        payload = b"hello-outbox"
+        digest = hashlib.sha256(payload).hexdigest()
+        resp = client.post(
+            "/outbox",
+            headers=AUTH,
+            data={"filename": "custom-name.bin", "sha256": digest},
+            files={"file": ("ignored.bin", payload, "application/octet-stream")},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["path"].endswith("custom-name.bin")
+        assert Path(body["path"]).read_bytes() == payload
+
+    def test_multipart_sha256_mismatch_rejected(self, client, env):
+        resp = client.post(
+            "/outbox",
+            headers=AUTH,
+            data={"sha256": "0" * 64},
+            files={"file": ("x.bin", b"abc", "application/octet-stream")},
+        )
+        assert resp.status_code == 400
+        assert resp.json()["success"] is False
+        assert list((env / "outbox").iterdir()) == []
+
+    def test_multipart_requires_auth_and_file(self, client, env):
+        assert client.post("/outbox", files={"file": ("a.bin", b"x")}).status_code == 401
+        resp = client.post("/outbox", headers=AUTH, data={"filename": "a.bin"})
+        assert resp.status_code == 400
+        assert "file" in resp.json()["message"]
 
 
 # --------------------------------------------------------------------------
